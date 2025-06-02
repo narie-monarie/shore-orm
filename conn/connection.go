@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/shore-orm/db"
+	"github.com/narie-monarie/shore-orm/db"
 	_ "github.com/sijms/go-ora/v2"
 )
 
