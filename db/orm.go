@@ -1,4 +1,3 @@
-// Need to break down this file tho
 package db
 
 import (
@@ -9,6 +8,7 @@ import (
 	"strings"
 )
 
+/*  Need to break down this file tho */
 type ORM struct {
 	Db *sql.DB
 }
