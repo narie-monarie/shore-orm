@@ -1,3 +1,4 @@
+// Need to break down this file tho
 package db
 
 import (
@@ -9,7 +10,7 @@ import (
 )
 
 type ORM struct {
-	Db *sql.DB // Exported for potential direct use if needed
+	Db *sql.DB
 }
 
 func NewORM(db *sql.DB) *ORM {
@@ -28,7 +29,7 @@ func (o *ORM) tableIsEmpty(ctx context.Context, tableName string) (bool, error) 
 	err := o.Db.QueryRowContext(ctx, query).Scan(&count)
 	if err != nil {
 		if oraErr, ok := err.(interface{ Code() int }); ok && oraErr.Code() == 942 {
-			return true, nil
+			return true, nil // Table doesn't exist, so it's "empty" for this purpose
 		}
 		return false, fmt.Errorf("checking if table %s is empty: %w", tableName, err)
 	}
@@ -47,17 +48,14 @@ func (o *ORM) CreateTable(ctx context.Context, schema TableSchema, opts ...Table
 		if err != nil {
 			fmt.Printf("%sWarning: could not determine if table %s is empty: %v. Defaulting to not drop based on this rule.%s\n", ColorYellow, schema.Name, err, ColorReset)
 		} else if isEmpty {
-			shouldDrop = true // Can drop if it's empty
-			fmt.Printf("%sTable %s is empty or does not exist. Will proceed with drop if DropIfExists is also true or if this is the only drop condition.%s\n", ColorYellow, schema.Name, ColorReset)
+			shouldDrop = true
+			fmt.Printf("%sTable %s is empty or does not exist. Will proceed with drop if configured.%s\n", ColorYellow, schema.Name, ColorReset)
 		} else { // Not empty
 			fmt.Printf("%sTable %s exists and is not empty. Skipping drop due to DropIfExistsAndEmpty option.%s\n", ColorYellow, schema.Name, ColorReset)
-			if !options.DropIfExists { // If DropIfExists was false, and it's not empty, definitely don't drop
+			if !options.DropIfExists {
 				shouldDrop = false
-			}
-			// If DropIfExists was true, but DropIfExistsAndEmpty is also true and table is NOT empty,
-			// then DropIfExistsAndEmpty takes precedence and we don't drop.
-			if options.DropIfExists { // If DropIfExists was true, this means we override it
-				shouldDrop = false
+			} else { // DropIfExists was true, but DropIfExistsAndEmpty is also true and table is NOT empty
+				shouldDrop = false // DropIfExistsAndEmpty
 			}
 		}
 	}
@@ -76,9 +74,14 @@ func (o *ORM) CreateTable(ctx context.Context, schema TableSchema, opts ...Table
 			fmt.Printf("%sTable %s dropped successfully.%s\n", ColorGreen, schema.Name, ColorReset)
 		}
 	} else if options.IgnoreExists {
-		// Simplified: if we didn't drop, and IgnoreExists is true, check if it exists.
-		// A more robust tableExists check might be needed if not dropping.
-		// For now, assume if not dropped, creation might proceed or fail.
+		//JUST MY THOUGHTS
+
+		/* If not dropping and IgnoreExists is true, we might want to check if table exists
+		and return nil if it does. For simplicity, this is omitted here, assuming
+		the CREATE TABLE will fail if it exists and IgnoreExists is not fully handled.
+		A proper tableExists check would be:
+		exists, _ := o.tableExists(ctx, schema.Name) // You'd need a tableExists method
+		if exists { return nil } */
 	}
 
 	createSQL := o.buildCreateTableSQL(schema)
@@ -154,7 +157,7 @@ func (o *ORM) buildColumnDefinition(col ColumnDef) string {
 		if fk.OnDelete != "" {
 			fkSQL += " ON DELETE " + strings.ToUpper(fk.OnDelete)
 		}
-		if fk.OnUpdate != "" {
+		if fk.OnUpdate != "" { // Oracle ON UPDATE caveat
 			fkSQL += " ON UPDATE " + strings.ToUpper(fk.OnUpdate)
 		}
 		parts = append(parts, fkSQL)
@@ -192,7 +195,6 @@ func resolveTableName(identifier any) (string, error) {
 	return tableName, nil
 }
 
-// --- CRUD Builders ---
 type InsertBuilder struct {
 	orm    *ORM
 	table  string
@@ -206,10 +208,12 @@ func (o *ORM) InsertInto(tableIdentifier any) *InsertBuilder {
 	}
 	return &InsertBuilder{orm: o, table: tableName}
 }
+
 func (ib *InsertBuilder) Values(data ...map[string]any) *InsertBuilder {
 	ib.values = append(ib.values, data...)
 	return ib
 }
+
 func (ib *InsertBuilder) ToSQL() (string, []any, error) {
 	if len(ib.values) == 0 {
 		return "", nil, errors.New("no values for insert")
@@ -227,6 +231,7 @@ func (ib *InsertBuilder) ToSQL() (string, []any, error) {
 	sql := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", ib.table, strings.Join(columns, ", "), strings.Join(placeholders, ", "))
 	return sql, qc.params, nil
 }
+
 func (ib *InsertBuilder) Exec(ctx context.Context) (sql.Result, error) {
 	query, args, err := ib.ToSQL()
 	if err != nil {
@@ -237,14 +242,13 @@ func (ib *InsertBuilder) Exec(ctx context.Context) (sql.Result, error) {
 }
 
 type SelectBuilder struct {
-	orm        *ORM
-	isDistinct bool
-	selections []QSelectable
-	fromTable  string
-	conditions []QCondition
-	orderBy    []QOrderTerm
-	limit      *int
-	offset     *int
+	orm           *ORM
+	isDistinct    bool
+	selections    []QSelectable
+	fromTable     string
+	conditions    []QCondition
+	orderBy       []QOrderTerm
+	limit, offset *int
 }
 
 func (o *ORM) Select(selections ...QSelectable) *SelectBuilder {
@@ -274,22 +278,21 @@ func (sb *SelectBuilder) From(tableIdentifier any) *SelectBuilder {
 	}
 	return sb
 }
+
 func (sb *SelectBuilder) Where(conditions ...QCondition) *SelectBuilder {
 	sb.conditions = append(sb.conditions, conditions...)
 	return sb
 }
+
 func (sb *SelectBuilder) OrderBy(terms ...QOrderTerm) *SelectBuilder {
 	sb.orderBy = append(sb.orderBy, terms...)
 	return sb
 }
-func (sb *SelectBuilder) Limit(count int) *SelectBuilder {
-	sb.limit = &count
-	return sb
-}
-func (sb *SelectBuilder) Offset(skip int) *SelectBuilder {
-	sb.offset = &skip
-	return sb
-}
+
+func (sb *SelectBuilder) Limit(count int) *SelectBuilder { sb.limit = &count; return sb }
+
+func (sb *SelectBuilder) Offset(skip int) *SelectBuilder { sb.offset = &skip; return sb }
+
 func (sb *SelectBuilder) ToSQL() (string, []any, error) {
 	if sb.fromTable == "" {
 		return "", nil, errors.New("from table not specified")
@@ -337,6 +340,7 @@ func (sb *SelectBuilder) ToSQL() (string, []any, error) {
 	}
 	return sqlStr, qc.params, nil
 }
+
 func (sb *SelectBuilder) QueryMaps(ctx context.Context) ([]map[string]any, error) {
 	query, args, err := sb.ToSQL()
 	if err != nil {
@@ -372,6 +376,7 @@ func (sb *SelectBuilder) QueryMaps(ctx context.Context) ([]map[string]any, error
 	}
 	return results, rows.Err()
 }
+
 func (sb *SelectBuilder) QueryScalar(ctx context.Context, dest any) error {
 	query, args, err := sb.ToSQL()
 	if err != nil {
