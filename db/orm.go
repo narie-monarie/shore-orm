@@ -8,6 +8,7 @@ import (
 	"strings"
 )
 
+/* Need to Break Down Thi File */
 type ORM struct {
 	Db *sql.DB
 }
@@ -132,7 +133,7 @@ func (o *ORM) buildColumnDefinition(col ColumnDef) (string, bool) {
 	if col.Size > 0 && (strings.Contains(colTypeUpper, "VARCHAR") || strings.Contains(colTypeUpper, "CHAR")) {
 		parts = append(parts, fmt.Sprintf("%s(%d)", col.Type, col.Size))
 	} else {
-		parts = append(parts, col.Type) // This will be "RAW(16)" for UUIDs or "NUMBER(19)" for Identity
+		parts = append(parts, col.Type)
 	}
 
 	isInlinePK := false
@@ -143,8 +144,6 @@ func (o *ORM) buildColumnDefinition(col ColumnDef) (string, bool) {
 	}
 
 	if col.Default != "" {
-		// If it's a UUID column with SYS_GUID(), that's its default.
-		// Avoid adding another "DEFAULT" clause if IsIdentity is true.
 		if !col.IsIdentity {
 			defaultUpper := strings.ToUpper(col.Default)
 			isKeywordDefault := defaultUpper == "CURRENT_TIMESTAMP" || defaultUpper == "SYSTIMESTAMP" || defaultUpper == "SYS_GUID()"

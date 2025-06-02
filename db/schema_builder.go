@@ -37,35 +37,29 @@ type ColumnBuilder struct {
 	column *ColumnDef
 }
 
-// PrimaryKey marks the column as a primary key.
-// For auto-generation, use UUID() or Identity().
 func (cb *ColumnBuilder) PrimaryKey() *ColumnBuilder {
 	cb.column.IsPrimaryKey = true
-	cb.column.IsNotNull = true // PKs are implicitly NOT NULL
+	cb.column.IsNotNull = true
 	return cb
 }
 
-// UUID configures the column as a UUID primary key (RAW(16) with SYS_GUID()).
 func (cb *ColumnBuilder) UUID() *ColumnBuilder {
 	cb.column.IsPrimaryKey = true
 	cb.column.IsNotNull = true
 	cb.column.Type = "RAW(16)"
 	cb.column.Default = "SYS_GUID()" // Oracle's function to generate GUIDs
-	cb.column.IsIdentity = false     // Explicitly not an integer identity
+	cb.column.IsIdentity = false
 	return cb
 }
 
-// Identity configures the column as an auto-incrementing integer primary key (Oracle 12c+).
-// Default type is NUMBER(19), can be overridden by setting Type before calling Identity.
 func (cb *ColumnBuilder) Identity() *ColumnBuilder {
 	cb.column.IsPrimaryKey = true
 	cb.column.IsNotNull = true
 	cb.column.IsIdentity = true
-	if cb.column.Type == "" || cb.column.Type == "RAW(16)" { // Default or if UUID was called before
-		cb.column.Type = "NUMBER(19)" // Default integer type for identity
+	if cb.column.Type == "" || cb.column.Type == "RAW(16)" {
+		cb.column.Type = "NUMBER(19)"
 	}
-	// The "GENERATED AS IDENTITY" part will be added by buildColumnDefinition
-	cb.column.Default = "" // Default is handled by IDENTITY
+	cb.column.Default = ""
 	return cb
 }
 
@@ -84,8 +78,6 @@ func (cb *ColumnBuilder) Size(size int) *ColumnBuilder {
 	return cb
 }
 
-// Default sets a default value for the column.
-// Avoid using with Identity() or UUID() as they set their own defaults.
 func (cb *ColumnBuilder) Default(value string) *ColumnBuilder {
 	if cb.column.IsIdentity || (cb.column.Type == "RAW(16)" && cb.column.Default == "SYS_GUID()") {
 		fmt.Printf("%sWarning: Default() called on a column that is already an Identity or UUID. Overwriting default may have unintended consequences.%s\n", ColorYellow, ColorReset)
