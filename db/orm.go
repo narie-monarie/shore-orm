@@ -6,7 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/google/uuid" // Keep for QContext addParam if still used there
 )
+
+// ANSI color codes (assuming they are defined in schema_types.go or here)
 
 // ORM is the main entry point for database operations.
 type ORM struct {
@@ -21,32 +25,49 @@ func NewORM(db *sql.DB) *ORM {
 // TableOptions configure table creation behavior.
 type TableOptions struct {
 	DropIfExists         bool
-	IgnoreExists         bool // If true and table exists, skip creation
+	IgnoreExists         bool
 	DropIfExistsAndEmpty bool
 }
 
+// ExistingColumnInfo holds information about a column fetched from the database.
+// This is an internal type for schema synchronization.
+type existingColumnInfo struct { // Made unexported as it's an internal detail
+	Name       string
+	Type       string
+	Length     sql.NullInt64
+	Precision  sql.NullInt64
+	Scale      sql.NullInt64
+	IsNullable bool
+	Default    sql.NullString
+}
+
+// tableExists checks if a table exists in the database.
 func (o *ORM) tableExists(ctx context.Context, tableName string) (bool, error) {
 	var count int
-	err := o.Db.QueryRowContext(ctx, strings.ToUpper(tableName)).Scan(&count)
+	upperTableName := strings.ToUpper(tableName)
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM user_tables WHERE table_name = '%s'`, upperTableName)
+	err := o.Db.QueryRowContext(ctx, query).Scan(&count)
 	if err != nil {
-		return false, fmt.Errorf("checking if table %s exists: %w", tableName, err)
+		return false, fmt.Errorf("error executing table existence check for %s: %w", upperTableName, err)
 	}
 	return count > 0, nil
 }
 
+// tableIsEmpty checks if a table has any rows.
 func (o *ORM) tableIsEmpty(ctx context.Context, tableName string) (bool, error) {
 	var count int
 	query := fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE ROWNUM = 1)", strings.ToUpper(tableName))
 	err := o.Db.QueryRowContext(ctx, query).Scan(&count)
 	if err != nil {
 		if oraErr, ok := err.(interface{ Code() int }); ok && oraErr.Code() == 942 {
-			return true, nil // Table doesn't exist, so it's "empty" for this purpose
+			return true, nil
 		}
 		return false, fmt.Errorf("checking if table %s is empty: %w", tableName, err)
 	}
 	return count == 0, nil
 }
 
+// CreateTable creates a table if it doesn't exist or handles dropping based on options.
 func (o *ORM) CreateTable(ctx context.Context, schema TableSchema, opts ...TableOptions) error {
 	var options TableOptions
 	if len(opts) > 0 {
@@ -59,7 +80,7 @@ func (o *ORM) CreateTable(ctx context.Context, schema TableSchema, opts ...Table
 	}
 
 	shouldDrop := false
-	if exists { // Only consider dropping if it exists
+	if exists {
 		if options.DropIfExists {
 			shouldDrop = true
 		} else if options.DropIfExistsAndEmpty {
@@ -77,7 +98,7 @@ func (o *ORM) CreateTable(ctx context.Context, schema TableSchema, opts ...Table
 
 	if shouldDrop {
 		dropSQL := fmt.Sprintf("DROP TABLE %s CASCADE CONSTRAINTS", schema.Name)
-		fmt.Printf("Attempting to drop table %s: %s%s%s\n", schema.Name, ColorCyan, dropSQL, ColorReset)
+		fmt.Printf("Attempting to drop table %s: %s%s%s\n", schema.Name, ColorCyan, dropSQL, ColorReset) // Single line
 		_, execErr := o.Db.ExecContext(ctx, dropSQL)
 		if execErr != nil {
 			if oraErr, ok := execErr.(interface{ Code() int }); ok && oraErr.Code() == 942 {
@@ -92,63 +113,141 @@ func (o *ORM) CreateTable(ctx context.Context, schema TableSchema, opts ...Table
 	}
 
 	if !exists {
+		createSQL := o.buildCreateTableSQL(schema)
+		fmt.Printf("Executing SQL for table %s: %s%s%s\n", schema.Name, ColorCyan, createSQL, ColorReset) // Single line
+		_, createErr := o.Db.ExecContext(ctx, createSQL)
+		if createErr != nil {
+			return fmt.Errorf("%sfailed to create table %s: %w%s", ColorRed, schema.Name, createErr, ColorReset)
+		}
+		fmt.Printf("%sTable %s created successfully.%s\n", ColorGreen, schema.Name, ColorReset)
 	} else {
 		if options.IgnoreExists {
 			fmt.Printf("%sTable %s already exists. Skipping creation due to IgnoreExists option.%s\n", ColorYellow, schema.Name, ColorReset)
 			return nil
 		}
-		fmt.Printf("%sTable %s already exists. DropIfExists/DropIfExistsAndEmpty conditions not met, and IgnoreExists is false. Creation will likely fail.%s\n", ColorYellow, schema.Name, ColorReset)
+		fmt.Printf("%sTable %s already exists and was not dropped. Will proceed to SyncSchema if defined.%s\n", ColorYellow, schema.Name, ColorReset)
 	}
 
-	createSQL := o.buildCreateTableSQL(schema)
-	fmt.Printf("Executing SQL for table %s:\n%s%s%s\n", schema.Name, ColorCyan, createSQL, ColorReset)
-	_, createErr := o.Db.ExecContext(ctx, createSQL)
-	if createErr != nil {
-		if oraErr, ok := createErr.(interface{ Code() int }); ok && oraErr.Code() == 955 {
-			if options.IgnoreExists && exists {
-				fmt.Printf("%sTable %s already existed, creation skipped as per IgnoreExists (confirmed by ORA-00955).%s\n", ColorYellow, schema.Name, ColorReset)
-				return nil
-			}
-		}
-		return fmt.Errorf("%sfailed to create table %s: %w%s", ColorRed, schema.Name, createErr, ColorReset)
-	}
-	fmt.Printf("%sTable %s created successfully (or already existed and was ignored).%s\n", ColorGreen, schema.Name, ColorReset)
-
-	for _, index := range schema.Indexes {
-		indexSQL := o.buildCreateIndexSQL(schema.Name, index)
-		fmt.Printf("Executing SQL for index %s on %s:\n%s%s%s\n", index.Name, schema.Name, ColorCyan, indexSQL, ColorReset)
-		_, iErr := o.Db.ExecContext(ctx, indexSQL)
-		if iErr != nil {
-			if oraErr, ok := iErr.(interface{ Code() int }); ok && (oraErr.Code() == 955 || oraErr.Code() == 1408) {
-				fmt.Printf("%sWarning: index %s on table %s likely already exists: %v%s\n", ColorYellow, index.Name, schema.Name, iErr, ColorReset)
-			} else {
-				return fmt.Errorf("%sfailed to create index %s: %w%s", ColorRed, index.Name, iErr, ColorReset)
+	if !exists || shouldDrop {
+		for _, index := range schema.Indexes {
+			indexSQL := o.buildCreateIndexSQL(schema.Name, index)
+			fmt.Printf("Executing SQL for index %s on %s: %s%s%s\n", index.Name, schema.Name, ColorCyan, indexSQL, ColorReset) // Single line
+			_, iErr := o.Db.ExecContext(ctx, indexSQL)
+			if iErr != nil {
+				if oraErr, ok := iErr.(interface{ Code() int }); ok && (oraErr.Code() == 955 || oraErr.Code() == 1408) {
+					fmt.Printf("%sWarning: index %s on table %s likely already exists: %v%s\n", ColorYellow, index.Name, schema.Name, iErr, ColorReset)
+				} else {
+					return fmt.Errorf("%sfailed to create index %s: %w%s", ColorRed, index.Name, iErr, ColorReset)
+				}
 			}
 		}
 	}
 	return nil
 }
 
-func (o *ORM) buildCreateTableSQL(schema TableSchema) string {
-	var columnDefs, primaryKeyCols, tableLevelConstraints []string
-	for _, col := range schema.Columns {
-		colSQL := o.buildColumnDefinition(col)
-		columnDefs = append(columnDefs, colSQL)
-		if col.IsPrimaryKey {
-			primaryKeyCols = append(primaryKeyCols, col.Name)
+// getTableColumns introspects the database for existing columns of a table. (unexported)
+func (o *ORM) getTableColumns(ctx context.Context, tableName string) (map[string]existingColumnInfo, error) {
+	query := `
+        SELECT
+            COLUMN_NAME,
+            DATA_TYPE,
+            NVL(CHAR_COL_DECL_LENGTH, DATA_LENGTH) as EFFECTIVE_LENGTH,
+            DATA_PRECISION,
+            DATA_SCALE,
+            NULLABLE,
+            DATA_DEFAULT
+        FROM USER_TAB_COLUMNS
+        WHERE TABLE_NAME = :1
+        ORDER BY COLUMN_ID
+    `
+	rows, err := o.Db.QueryContext(ctx, query, strings.ToUpper(tableName))
+	if err != nil {
+		return nil, fmt.Errorf("querying columns for table %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	existingCols := make(map[string]existingColumnInfo)
+	for rows.Next() {
+		var col existingColumnInfo
+		var nullableStr string
+		var effectiveLength sql.NullInt64
+
+		err := rows.Scan(
+			&col.Name,
+			&col.Type,
+			&effectiveLength,
+			&col.Precision,
+			&col.Scale,
+			&nullableStr,
+			&col.Default,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning column info for table %s: %w", tableName, err)
+		}
+		col.IsNullable = (nullableStr == "Y")
+		col.Length = effectiveLength
+		existingCols[col.Name] = col
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating column info for table %s: %w", tableName, err)
+	}
+	return existingCols, nil
+}
+
+// SyncSchema attempts to add missing columns from the Go schema definition to the database table.
+func (o *ORM) SyncSchema(ctx context.Context, schema TableSchema) error {
+	fmt.Printf("%sSyncing schema for table %s...%s\n", ColorYellow, schema.Name, ColorReset)
+
+	exists, err := o.tableExists(ctx, schema.Name)
+	if err != nil {
+		return fmt.Errorf("could not check existence of table %s for sync: %w", schema.Name, err)
+	}
+
+	if !exists {
+		fmt.Printf("%sTable %s does not exist. Cannot sync. Please use CreateTable first.%s\n", ColorRed, schema.Name, ColorReset)
+		return fmt.Errorf("table %s does not exist, cannot sync columns", schema.Name)
+	}
+
+	existingDBCols, err := o.getTableColumns(ctx, schema.Name) // Use unexported getTableColumns
+	if err != nil {
+		return fmt.Errorf("could not get existing columns for table %s: %w", schema.Name, err)
+	}
+
+	var columnsToAdd []ColumnDef
+	for _, desiredCol := range schema.Columns {
+		if _, found := existingDBCols[desiredCol.Name]; !found {
+			columnsToAdd = append(columnsToAdd, desiredCol)
 		}
 	}
-	if len(primaryKeyCols) > 0 {
-		tableLevelConstraints = append(tableLevelConstraints, fmt.Sprintf("PRIMARY KEY (%s)", strings.Join(primaryKeyCols, ", ")))
+
+	if len(columnsToAdd) == 0 {
+		fmt.Printf("%sSchema for table %s appears up to date (no missing columns found).%s\n", ColorGreen, schema.Name, ColorReset)
+		return nil
 	}
-	sql := fmt.Sprintf("CREATE TABLE %s (\n  %s", schema.Name, strings.Join(columnDefs, ",\n  "))
-	if len(tableLevelConstraints) > 0 {
-		sql += ",\n  " + strings.Join(tableLevelConstraints, ",\n  ")
+
+	var addClauses []string
+	for _, colDef := range columnsToAdd {
+		colSQL := o.buildColumnDefinitionForAlter(colDef)
+		addClauses = append(addClauses, colSQL)
+		fmt.Printf("%sPlanning to add column to %s: %s%s\n", ColorCyan, schema.Name, colSQL, ColorReset)
 	}
-	sql += "\n)"
-	return sql
+
+	alterSQL := fmt.Sprintf("ALTER TABLE %s ADD (%s)",
+		schema.Name,
+		strings.Join(addClauses, ", "),
+	)
+
+	fmt.Printf("%sExecuting Alter Table (Add Columns): %s%s%s\n", ColorGreen, ColorCyan, alterSQL, ColorReset) // Single line
+	_, execErr := o.Db.ExecContext(ctx, alterSQL)
+	if execErr != nil {
+		return fmt.Errorf("failed to add columns to table %s: %w", schema.Name, execErr)
+	}
+
+	fmt.Printf("%sColumns added successfully to %s.%s\n", ColorGreen, schema.Name, ColorReset)
+	return nil
 }
-func (o *ORM) buildColumnDefinition(col ColumnDef) string {
+
+func (o *ORM) buildColumnDefinitionForAlter(col ColumnDef) string {
 	var parts []string
 	parts = append(parts, col.Name)
 	colTypeUpper := strings.ToUpper(col.Type)
@@ -174,6 +273,68 @@ func (o *ORM) buildColumnDefinition(col ColumnDef) string {
 		parts = append(parts, "UNIQUE")
 	}
 	if col.ForeignKey != nil {
+		fmt.Printf("%sWarning: Inline FK definition for new column '%s' in ALTER TABLE is complex; add FK as separate constraint.%s\n", ColorYellow, col.Name, ColorReset)
+	}
+	if col.IsPrimaryKey {
+		fmt.Printf("%sWarning: Inline PK definition for new column '%s' in ALTER TABLE is not standard.%s\n", ColorYellow, col.Name, ColorReset)
+	}
+	return strings.Join(parts, " ")
+}
+func (o *ORM) buildCreateTableSQL(schema TableSchema) string {
+	var columnDefs, primaryKeyCols, tableLevelConstraints []string
+	hasInlinePK := false
+	for _, col := range schema.Columns {
+		colSQL, isColInlinePK := o.buildColumnDefinition(col)
+		columnDefs = append(columnDefs, colSQL)
+		if isColInlinePK {
+			hasInlinePK = true
+		} else if col.IsPrimaryKey {
+			primaryKeyCols = append(primaryKeyCols, col.Name)
+		}
+	}
+	if !hasInlinePK && len(primaryKeyCols) > 0 {
+		tableLevelConstraints = append(tableLevelConstraints, fmt.Sprintf("PRIMARY KEY (%s)", strings.Join(primaryKeyCols, ", ")))
+	}
+	sql := fmt.Sprintf("CREATE TABLE %s (\n  %s", schema.Name, strings.Join(columnDefs, ",\n  "))
+	if len(tableLevelConstraints) > 0 {
+		sql += ",\n  " + strings.Join(tableLevelConstraints, ",\n  ")
+	}
+	sql += "\n)"
+	return sql
+}
+func (o *ORM) buildColumnDefinition(col ColumnDef) (string, bool) {
+	var parts []string
+	parts = append(parts, col.Name)
+	colTypeUpper := strings.ToUpper(col.Type)
+	if col.Size > 0 && (strings.Contains(colTypeUpper, "VARCHAR") || strings.Contains(colTypeUpper, "CHAR")) {
+		parts = append(parts, fmt.Sprintf("%s(%d)", col.Type, col.Size))
+	} else {
+		parts = append(parts, col.Type)
+	}
+	isInlinePK := false
+	// This part is for Oracle Identity Columns if you re-add .Identity() to ColumnBuilder
+	// and ColumnDef gets an IsIdentity flag.
+	// if col.IsIdentity && col.IsPrimaryKey {
+	// parts = append(parts, "GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY")
+	// isInlinePK = true
+	// }
+	if col.Default != "" { // && !col.IsIdentity (if IsIdentity flag exists)
+		defaultUpper := strings.ToUpper(col.Default)
+		isKeywordDefault := defaultUpper == "CURRENT_TIMESTAMP" || defaultUpper == "SYSTIMESTAMP" || defaultUpper == "SYS_GUID()"
+		needsQuotes := (strings.Contains(colTypeUpper, "VARCHAR") || strings.Contains(colTypeUpper, "CHAR")) || ((strings.Contains(colTypeUpper, "TIMESTAMP") || strings.Contains(colTypeUpper, "DATE")) && !isKeywordDefault)
+		if !isKeywordDefault && needsQuotes {
+			parts = append(parts, "DEFAULT", fmt.Sprintf("'%s'", col.Default))
+		} else {
+			parts = append(parts, "DEFAULT", col.Default)
+		}
+	}
+	if col.IsNotNull && !isInlinePK {
+		parts = append(parts, "NOT NULL")
+	}
+	if col.IsUnique {
+		parts = append(parts, "UNIQUE")
+	}
+	if col.ForeignKey != nil {
 		fk := col.ForeignKey
 		fkSQL := fmt.Sprintf("REFERENCES %s(%s)", strings.ToUpper(fk.ReferencedTable), strings.ToUpper(fk.ReferencedColumn))
 		if fk.OnDelete != "" {
@@ -184,7 +345,7 @@ func (o *ORM) buildColumnDefinition(col ColumnDef) string {
 		}
 		parts = append(parts, fkSQL)
 	}
-	return strings.Join(parts, " ")
+	return strings.Join(parts, " "), isInlinePK
 }
 func (o *ORM) buildCreateIndexSQL(tableName string, index IndexDef) string {
 	indexType := "INDEX"
@@ -215,6 +376,7 @@ func resolveTableName(identifier any) (string, error) {
 	return tableName, nil
 }
 
+// --- CRUD Builders (Single Line SQL Logging) ---
 type InsertBuilder struct {
 	orm    *ORM
 	table  string
@@ -254,7 +416,7 @@ func (ib *InsertBuilder) Exec(ctx context.Context) (sql.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("%sExecuting Insert:%s\n%s%s%s\nArgs: %v\n", ColorGreen, ColorReset, ColorCyan, query, ColorReset, args)
+	fmt.Printf("%sExecuting Insert: %s%s%s Args: %v%s\n", ColorGreen, ColorCyan, query, ColorReset, args, ColorReset)
 	return ib.orm.Db.ExecContext(ctx, query, args...)
 }
 
@@ -357,13 +519,14 @@ func (sb *SelectBuilder) QueryMaps(ctx context.Context) ([]map[string]any, error
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("%sExecuting Select:%s\n%s%s%s\nArgs: %v\n", ColorGreen, ColorReset, ColorCyan, query, ColorReset, args)
+	fmt.Printf("%sExecuting Select: %s%s%s Args: %v%s\n", ColorGreen, ColorCyan, query, ColorReset, args, ColorReset)
 	rows, err := sb.orm.Db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	columns, _ := rows.Columns()
+	colTypes, _ := rows.ColumnTypes()
 	var results []map[string]any
 	for rows.Next() {
 		values := make([]any, len(columns))
@@ -378,7 +541,23 @@ func (sb *SelectBuilder) QueryMaps(ctx context.Context) ([]map[string]any, error
 		for i, colName := range columns {
 			var val = values[i]
 			if b, ok := val.([]byte); ok {
-				entry[colName] = fmt.Sprintf("%x", b)
+				isLikelyUUID := false
+				if colTypes != nil && i < len(colTypes) {
+					dbTypeName := strings.ToUpper(colTypes[i].DatabaseTypeName())
+					if dbTypeName == "RAW" && len(b) == 16 {
+						isLikelyUUID = true
+					}
+				}
+				if isLikelyUUID {
+					parsedUUID, uuidErr := uuid.FromBytes(b)
+					if uuidErr == nil {
+						entry[colName] = parsedUUID.String()
+					} else {
+						entry[colName] = fmt.Sprintf("%x (uuid parse error: %v)", b, uuidErr)
+					}
+				} else {
+					entry[colName] = fmt.Sprintf("%x", b)
+				}
 			} else {
 				entry[colName] = val
 			}
@@ -392,7 +571,7 @@ func (sb *SelectBuilder) QueryScalar(ctx context.Context, dest any) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%sExecuting Select Scalar:%s\n%s%s%s\nArgs: %v\n", ColorGreen, ColorReset, ColorCyan, query, ColorReset, args)
+	fmt.Printf("%sExecuting Select Scalar: %s%s%s Args: %v%s\n", ColorGreen, ColorCyan, query, ColorReset, args, ColorReset)
 	row := sb.orm.Db.QueryRowContext(ctx, query, args...)
 	return row.Scan(dest)
 }
@@ -450,7 +629,7 @@ func (ub *UpdateBuilder) Exec(ctx context.Context) (sql.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("%sExecuting Update:%s\n%s%s%s\nArgs: %v\n", ColorGreen, ColorReset, ColorCyan, query, ColorReset, args)
+	fmt.Printf("%sExecuting Update: %s%s%s Args: %v%s\n", ColorGreen, ColorCyan, query, ColorReset, args, ColorReset)
 	return ub.orm.Db.ExecContext(ctx, query, args...)
 }
 
@@ -492,6 +671,6 @@ func (dbuilder *DeleteBuilder) Exec(ctx context.Context) (sql.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("%sExecuting Delete:%s\n%s%s%s\nArgs: %v\n", ColorGreen, ColorReset, ColorCyan, query, ColorReset, args)
+	fmt.Printf("%sExecuting Delete: %s%s%s Args: %v%s\n", ColorGreen, ColorCyan, query, ColorReset, args, ColorReset)
 	return dbuilder.orm.Db.ExecContext(ctx, query, args...)
 }

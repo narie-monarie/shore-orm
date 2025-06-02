@@ -55,11 +55,11 @@ func (cb *ColumnBuilder) UUID() *ColumnBuilder {
 func (cb *ColumnBuilder) Identity() *ColumnBuilder {
 	cb.column.IsPrimaryKey = true
 	cb.column.IsNotNull = true
-	cb.column.IsIdentity = true
+	cb.column.IsIdentity = true // Set the flag
 	if cb.column.Type == "" || cb.column.Type == "RAW(16)" {
 		cb.column.Type = "NUMBER(19)"
 	}
-	cb.column.Default = ""
+	cb.column.Default = "" // Default is handled by "GENERATED AS IDENTITY"
 	return cb
 }
 
