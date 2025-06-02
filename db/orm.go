@@ -8,19 +8,30 @@ import (
 	"strings"
 )
 
-/* Need to Break Down Thi File */
+// ORM is the main entry point for database operations.
 type ORM struct {
 	Db *sql.DB
 }
 
+// NewORM creates a new ORM instance.
 func NewORM(db *sql.DB) *ORM {
 	return &ORM{Db: db}
 }
 
+// TableOptions configure table creation behavior.
 type TableOptions struct {
 	DropIfExists         bool
-	IgnoreExists         bool
+	IgnoreExists         bool // If true and table exists, skip creation
 	DropIfExistsAndEmpty bool
+}
+
+func (o *ORM) tableExists(ctx context.Context, tableName string) (bool, error) {
+	var count int
+	err := o.Db.QueryRowContext(ctx, strings.ToUpper(tableName)).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("checking if table %s exists: %w", tableName, err)
+	}
+	return count > 0, nil
 }
 
 func (o *ORM) tableIsEmpty(ctx context.Context, tableName string) (bool, error) {
@@ -29,7 +40,7 @@ func (o *ORM) tableIsEmpty(ctx context.Context, tableName string) (bool, error) 
 	err := o.Db.QueryRowContext(ctx, query).Scan(&count)
 	if err != nil {
 		if oraErr, ok := err.(interface{ Code() int }); ok && oraErr.Code() == 942 {
-			return true, nil
+			return true, nil // Table doesn't exist, so it's "empty" for this purpose
 		}
 		return false, fmt.Errorf("checking if table %s is empty: %w", tableName, err)
 	}
@@ -42,20 +53,24 @@ func (o *ORM) CreateTable(ctx context.Context, schema TableSchema, opts ...Table
 		options = opts[0]
 	}
 
-	shouldDrop := options.DropIfExists
-	if options.DropIfExistsAndEmpty {
-		isEmpty, err := o.tableIsEmpty(ctx, schema.Name)
-		if err != nil {
-			fmt.Printf("%sWarning: could not determine if table %s is empty: %v. Defaulting to not drop based on this rule.%s\n", ColorYellow, schema.Name, err, ColorReset)
-		} else if isEmpty {
+	exists, err := o.tableExists(ctx, schema.Name)
+	if err != nil {
+		fmt.Printf("%sWarning: could not determine if table %s exists: %v%s\n", ColorYellow, schema.Name, err, ColorReset)
+	}
+
+	shouldDrop := false
+	if exists { // Only consider dropping if it exists
+		if options.DropIfExists {
 			shouldDrop = true
-			fmt.Printf("%sTable %s is empty or does not exist. Will proceed with drop if configured.%s\n", ColorYellow, schema.Name, ColorReset)
-		} else {
-			fmt.Printf("%sTable %s exists and is not empty. Skipping drop due to DropIfExistsAndEmpty option.%s\n", ColorYellow, schema.Name, ColorReset)
-			if !options.DropIfExists {
-				shouldDrop = false
+		} else if options.DropIfExistsAndEmpty {
+			isEmpty, emptyCheckErr := o.tableIsEmpty(ctx, schema.Name)
+			if emptyCheckErr != nil {
+				fmt.Printf("%sWarning: could not determine if table %s is empty for DropIfExistsAndEmpty: %v. Will not drop based on this rule.%s\n", ColorYellow, schema.Name, emptyCheckErr, ColorReset)
+			} else if isEmpty {
+				shouldDrop = true
+				fmt.Printf("%sTable %s is empty. Will be dropped and recreated.%s\n", ColorYellow, schema.Name, ColorReset)
 			} else {
-				shouldDrop = false
+				fmt.Printf("%sTable %s exists and is not empty. Skipping drop due to DropIfExistsAndEmpty option.%s\n", ColorYellow, schema.Name, ColorReset)
 			}
 		}
 	}
@@ -63,24 +78,41 @@ func (o *ORM) CreateTable(ctx context.Context, schema TableSchema, opts ...Table
 	if shouldDrop {
 		dropSQL := fmt.Sprintf("DROP TABLE %s CASCADE CONSTRAINTS", schema.Name)
 		fmt.Printf("Attempting to drop table %s: %s%s%s\n", schema.Name, ColorCyan, dropSQL, ColorReset)
-		_, err := o.Db.ExecContext(ctx, dropSQL)
-		if err != nil {
-			if oraErr, ok := err.(interface{ Code() int }); ok && oraErr.Code() == 942 {
-				fmt.Printf("%sTable %s did not exist, skipping drop.%s\n", ColorYellow, schema.Name, ColorReset)
+		_, execErr := o.Db.ExecContext(ctx, dropSQL)
+		if execErr != nil {
+			if oraErr, ok := execErr.(interface{ Code() int }); ok && oraErr.Code() == 942 {
+				fmt.Printf("%sTable %s did not exist (or was already dropped).%s\n", ColorYellow, schema.Name, ColorReset)
 			} else {
-				fmt.Printf("%sWarning: error dropping table %s: %v%s\n", ColorYellow, schema.Name, err, ColorReset)
+				fmt.Printf("%sWarning: error dropping table %s: %v%s\n", ColorYellow, schema.Name, execErr, ColorReset)
 			}
 		} else {
 			fmt.Printf("%sTable %s dropped successfully.%s\n", ColorGreen, schema.Name, ColorReset)
 		}
+		exists = false
+	}
+
+	if !exists {
+	} else {
+		if options.IgnoreExists {
+			fmt.Printf("%sTable %s already exists. Skipping creation due to IgnoreExists option.%s\n", ColorYellow, schema.Name, ColorReset)
+			return nil
+		}
+		fmt.Printf("%sTable %s already exists. DropIfExists/DropIfExistsAndEmpty conditions not met, and IgnoreExists is false. Creation will likely fail.%s\n", ColorYellow, schema.Name, ColorReset)
 	}
 
 	createSQL := o.buildCreateTableSQL(schema)
 	fmt.Printf("Executing SQL for table %s:\n%s%s%s\n", schema.Name, ColorCyan, createSQL, ColorReset)
-	_, err := o.Db.ExecContext(ctx, createSQL)
-	if err != nil {
-		return fmt.Errorf("%sfailed to create table %s: %w%s", ColorRed, schema.Name, err, ColorReset)
+	_, createErr := o.Db.ExecContext(ctx, createSQL)
+	if createErr != nil {
+		if oraErr, ok := createErr.(interface{ Code() int }); ok && oraErr.Code() == 955 {
+			if options.IgnoreExists && exists {
+				fmt.Printf("%sTable %s already existed, creation skipped as per IgnoreExists (confirmed by ORA-00955).%s\n", ColorYellow, schema.Name, ColorReset)
+				return nil
+			}
+		}
+		return fmt.Errorf("%sfailed to create table %s: %w%s", ColorRed, schema.Name, createErr, ColorReset)
 	}
+	fmt.Printf("%sTable %s created successfully (or already existed and was ignored).%s\n", ColorGreen, schema.Name, ColorReset)
 
 	for _, index := range schema.Indexes {
 		indexSQL := o.buildCreateIndexSQL(schema.Name, index)
@@ -98,25 +130,17 @@ func (o *ORM) CreateTable(ctx context.Context, schema TableSchema, opts ...Table
 }
 
 func (o *ORM) buildCreateTableSQL(schema TableSchema) string {
-	var columnDefs []string
-	var primaryKeyCols []string
-	var tableLevelConstraints []string
-	hasInlinePK := false
-
+	var columnDefs, primaryKeyCols, tableLevelConstraints []string
 	for _, col := range schema.Columns {
-		colSQL, isColInlinePK := o.buildColumnDefinition(col)
+		colSQL := o.buildColumnDefinition(col)
 		columnDefs = append(columnDefs, colSQL)
-		if isColInlinePK {
-			hasInlinePK = true
-		} else if col.IsPrimaryKey {
+		if col.IsPrimaryKey {
 			primaryKeyCols = append(primaryKeyCols, col.Name)
 		}
 	}
-
-	if !hasInlinePK && len(primaryKeyCols) > 0 {
+	if len(primaryKeyCols) > 0 {
 		tableLevelConstraints = append(tableLevelConstraints, fmt.Sprintf("PRIMARY KEY (%s)", strings.Join(primaryKeyCols, ", ")))
 	}
-
 	sql := fmt.Sprintf("CREATE TABLE %s (\n  %s", schema.Name, strings.Join(columnDefs, ",\n  "))
 	if len(tableLevelConstraints) > 0 {
 		sql += ",\n  " + strings.Join(tableLevelConstraints, ",\n  ")
@@ -124,46 +148,31 @@ func (o *ORM) buildCreateTableSQL(schema TableSchema) string {
 	sql += "\n)"
 	return sql
 }
-
-func (o *ORM) buildColumnDefinition(col ColumnDef) (string, bool) {
+func (o *ORM) buildColumnDefinition(col ColumnDef) string {
 	var parts []string
 	parts = append(parts, col.Name)
 	colTypeUpper := strings.ToUpper(col.Type)
-
 	if col.Size > 0 && (strings.Contains(colTypeUpper, "VARCHAR") || strings.Contains(colTypeUpper, "CHAR")) {
 		parts = append(parts, fmt.Sprintf("%s(%d)", col.Type, col.Size))
 	} else {
 		parts = append(parts, col.Type)
 	}
-
-	isInlinePK := false
-	if col.IsPrimaryKey && col.IsIdentity {
-		parts = append(parts, "GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY")
-		isInlinePK = true
-	} else if col.IsPrimaryKey && col.Type == "RAW(16)" && col.Default == "SYS_GUID()" {
-	}
-
 	if col.Default != "" {
-		if !col.IsIdentity {
-			defaultUpper := strings.ToUpper(col.Default)
-			isKeywordDefault := defaultUpper == "CURRENT_TIMESTAMP" || defaultUpper == "SYSTIMESTAMP" || defaultUpper == "SYS_GUID()"
-			needsQuotes := (strings.Contains(colTypeUpper, "VARCHAR") || strings.Contains(colTypeUpper, "CHAR")) || ((strings.Contains(colTypeUpper, "TIMESTAMP") || strings.Contains(colTypeUpper, "DATE")) && !isKeywordDefault)
-
-			if !isKeywordDefault && needsQuotes {
-				parts = append(parts, "DEFAULT", fmt.Sprintf("'%s'", col.Default))
-			} else {
-				parts = append(parts, "DEFAULT", col.Default)
-			}
+		defaultUpper := strings.ToUpper(col.Default)
+		isKeywordDefault := defaultUpper == "CURRENT_TIMESTAMP" || defaultUpper == "SYSTIMESTAMP" || defaultUpper == "SYS_GUID()"
+		needsQuotes := (strings.Contains(colTypeUpper, "VARCHAR") || strings.Contains(colTypeUpper, "CHAR")) || ((strings.Contains(colTypeUpper, "TIMESTAMP") || strings.Contains(colTypeUpper, "DATE")) && !isKeywordDefault)
+		if !isKeywordDefault && needsQuotes {
+			parts = append(parts, "DEFAULT", fmt.Sprintf("'%s'", col.Default))
+		} else {
+			parts = append(parts, "DEFAULT", col.Default)
 		}
 	}
-
-	if col.IsNotNull && !isInlinePK {
+	if col.IsNotNull {
 		parts = append(parts, "NOT NULL")
 	}
 	if col.IsUnique {
 		parts = append(parts, "UNIQUE")
 	}
-
 	if col.ForeignKey != nil {
 		fk := col.ForeignKey
 		fkSQL := fmt.Sprintf("REFERENCES %s(%s)", strings.ToUpper(fk.ReferencedTable), strings.ToUpper(fk.ReferencedColumn))
@@ -175,9 +184,8 @@ func (o *ORM) buildColumnDefinition(col ColumnDef) (string, bool) {
 		}
 		parts = append(parts, fkSQL)
 	}
-	return strings.Join(parts, " "), isInlinePK
+	return strings.Join(parts, " ")
 }
-
 func (o *ORM) buildCreateIndexSQL(tableName string, index IndexDef) string {
 	indexType := "INDEX"
 	if index.IsUnique {

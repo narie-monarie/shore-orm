@@ -47,7 +47,7 @@ func (cb *ColumnBuilder) UUID() *ColumnBuilder {
 	cb.column.IsPrimaryKey = true
 	cb.column.IsNotNull = true
 	cb.column.Type = "RAW(16)"
-	cb.column.Default = "SYS_GUID()" // Oracle's function to generate GUIDs
+	cb.column.Default = "SYS_GUID()" // Oracle's Function To Generate GUIDs
 	cb.column.IsIdentity = false
 	return cb
 }
