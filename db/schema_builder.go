@@ -72,8 +72,8 @@ func (cb *ColumnBuilder) ForeignKey(refTable, refCol string) *ColumnBuilder {
 	if cb.column.ForeignKey == nil {
 		cb.column.ForeignKey = &ForeignKeyDef{}
 	}
-	cb.column.ForeignKey.ReferencedTable = refTable
-	cb.column.ForeignKey.ReferencedColumn = refCol
+	cb.column.ForeignKey.ReferencedTable = strings.ToUpper(refTable)
+	cb.column.ForeignKey.ReferencedColumn = strings.ToUpper(refCol)
 	return cb
 }
 

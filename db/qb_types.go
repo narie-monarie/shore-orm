@@ -29,6 +29,8 @@ func (qc *QContext) addParam(value any) string {
 	if u, ok := value.(uuid.UUID); ok && qc.dialect == "oracle" {
 		valueBytes, err := u.MarshalBinary()
 		if err != nil {
+			// This should ideally not panic in a library but return an error
+			// For simplicity in this context, panic indicates a severe issue.
 			panic(fmt.Sprintf("failed to marshal UUID to binary for query parameter: %v", err))
 		}
 		qc.params = append(qc.params, valueBytes)
@@ -119,13 +121,15 @@ type QBinaryCondition struct {
 
 func (bc QBinaryCondition) ToSQL(qc *QContext) (string, error) {
 	leftSQL, _ := bc.Left.GetSelectionSQL(qc)
-	placeholder := qc.addParam(bc.Right) // addParam now handles UUID
+	placeholder := qc.addParam(bc.Right)
 	return fmt.Sprintf("%s %s %s", leftSQL, bc.Operator, placeholder), nil
 }
 
 func Eq(column QColumn, value any) QCondition {
 	return QBinaryCondition{Left: column, Operator: "=", Right: value}
 }
+
+//TODO: Add other condition functions like Ne, Gt, Lt, In, Like, etc. as needed
 
 type QOrderTerm struct {
 	Column    QColumn
