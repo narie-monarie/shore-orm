@@ -15,15 +15,15 @@ var (
 	ormInstance *db.ORM
 )
 
-func InitDB(ctx context.Context, dsn string) error {
+func InitDB(ctx context.Context, dsn string) (*db.ORM, error) {
 	if dbInstance != nil {
-		return fmt.Errorf("database already initialized")
+		return ormInstance, fmt.Errorf("database already initialized")
 	}
 
 	var err error
 	dbInstance, err = sql.Open("oracle", dsn)
 	if err != nil {
-		return fmt.Errorf("error opening database connection: %w", err)
+		return nil, fmt.Errorf("error opening database connection: %w", err)
 	}
 
 	dbInstance.SetMaxOpenConns(25)
@@ -33,24 +33,24 @@ func InitDB(ctx context.Context, dsn string) error {
 	if err = dbInstance.PingContext(ctx); err != nil {
 		dbInstance.Close()
 		dbInstance = nil
-		return fmt.Errorf("error pinging database: %w", err)
+		return nil, fmt.Errorf("error pinging database: %w", err)
 	}
 
 	ormInstance = db.NewORM(dbInstance)
 	fmt.Printf("%sDatabase connection and ORM initialized successfully!%s\n", db.ColorGreen, db.ColorReset)
-	return nil
+	return ormInstance, nil
 }
 
 func GetDB() *sql.DB {
 	if dbInstance == nil {
-		panic("database not initialized. Call db.InitDB() first.")
+		panic("database not initialized. Call dbutil.InitDB() first.")
 	}
 	return dbInstance
 }
 
 func GetORM() *db.ORM {
 	if ormInstance == nil {
-		panic("ORM not initialized. Call db.InitDB() first.")
+		panic("ORM not initialized. Call dbutil.InitDB() first.")
 	}
 	return ormInstance
 }
